@@ -1067,8 +1067,10 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 }
 
 func singleLlamaServerGPUPlacement(gpu ml.DeviceInfo, opts api.Options) ([]ml.DeviceInfo, api.Options) {
-	mainGPU := 0
-	opts.MainGPU = &mainGPU
+	if opts.MainGPU == nil {
+		mainGPU := 0
+		opts.MainGPU = &mainGPU
+	}
 	return []ml.DeviceInfo{gpu}, opts
 }
 

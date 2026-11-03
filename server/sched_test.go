@@ -1570,7 +1570,33 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 				Runner: api.Runner{MainGPU: testIntPtr(1), NumGPU: -1},
 			},
 			wantLibrary:      "ROCm",
-			wantMainGPU:      testIntPtr(0),
+			// A user explicitly requested main_gpu=1; the selected card is ID "1",
+			// so the launch option must remain 1 (not be reset to 0).
+			wantMainGPU:      testIntPtr(1),
+			wantSelectedGPUs: 1,
+			wantGPUID:        "1",
+		},
+		{
+			name: "explicit main_gpu is preserved (not reset to 0) for the selected card",
+			// A user pins main_gpu=1 and asks for a single GPU (NumGPU=-1).
+			// Placement correctly selects the ROCm group containing ID "1" via
+			// bestExplicitMainGPU, but singleLlamaServerGPUPlacement currently
+			// overwrites opts.MainGPU with 0. The launched runner then receives
+			// --main-gpu 0 even though the selected device is ID 1. This case
+			// asserts the *identity* of the selected card survives to the launch
+			// options, so the runner's --main-gpu matches the device that was
+			// actually placed.
+			predictedVRAM: 8 * format.GigaByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 10 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, FreeMemory: 20 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, FreeMemory: 24 * format.GigaByte},
+			},
+			opts: api.Options{
+				Runner: api.Runner{MainGPU: testIntPtr(1), NumGPU: -1},
+			},
+			wantLibrary:      "ROCm",
+			wantMainGPU:      testIntPtr(1),
 			wantSelectedGPUs: 1,
 			wantGPUID:        "1",
 		},
