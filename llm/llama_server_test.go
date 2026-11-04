@@ -4058,3 +4058,31 @@ func TestLlamaServerCompletionThinkingFormat(t *testing.T) {
 		t.Errorf("json format converted a schema, %d conversions", got)
 	}
 }
+
+func TestPredictServerVRAMFloor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	// A real model path we control: create a temp file of a known size and
+	// confirm the floor is >= that size (non-zero) even with no gguf.Model.
+	// This locks the contract: callers can rely on the floor to distinguish
+	// "size is known" (non-zero) from "size is unknown" (0).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(path, make([]byte, 17*1024*1024*1024), 0o644); err != nil {
+		// Fallback to a smaller file if 17 GiB allocation is not available.
+		if err2 := os.WriteFile(path, make([]byte, 1024*1024), 0o644); err2 != nil {
+			t.Fatalf("write temp model: %v", err2)
+		}
+	}
+
+	floor := PredictServerVRAMFloor(path, nil)
+	if floor == 0 {
+		t.Fatalf("PredictServerVRAMFloor(%q, nil) = 0; want non-zero (size known)", path)
+	}
+
+	// Unknown path: floor must be 0 (size truly unknown).
+	if got := PredictServerVRAMFloor(filepath.Join(dir, "does-not-exist.gguf"), nil); got != 0 {
+		t.Errorf("PredictServerVRAMFloor(missing, nil) = %d; want 0 (size unknown)", got)
+	}
+}

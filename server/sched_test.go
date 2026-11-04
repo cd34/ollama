@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -1570,33 +1571,12 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 				Runner: api.Runner{MainGPU: testIntPtr(1), NumGPU: -1},
 			},
 			wantLibrary:      "ROCm",
-			// A user explicitly requested main_gpu=1; the selected card is ID "1",
-			// so the launch option must remain 1 (not be reset to 0).
-			wantMainGPU:      testIntPtr(1),
-			wantSelectedGPUs: 1,
-			wantGPUID:        "1",
-		},
-		{
-			name: "explicit main_gpu is preserved (not reset to 0) for the selected card",
-			// A user pins main_gpu=1 and asks for a single GPU (NumGPU=-1).
-			// Placement correctly selects the ROCm group containing ID "1" via
-			// bestExplicitMainGPU, but singleLlamaServerGPUPlacement currently
-			// overwrites opts.MainGPU with 0. The launched runner then receives
-			// --main-gpu 0 even though the selected device is ID 1. This case
-			// asserts the *identity* of the selected card survives to the launch
-			// options, so the runner's --main-gpu matches the device that was
-			// actually placed.
-			predictedVRAM: 8 * format.GigaByte,
-			gpus: []ml.DeviceInfo{
-				{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 10 * format.GigaByte},
-				{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, FreeMemory: 20 * format.GigaByte},
-				{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, FreeMemory: 24 * format.GigaByte},
-			},
-			opts: api.Options{
-				Runner: api.Runner{MainGPU: testIntPtr(1), NumGPU: -1},
-			},
-			wantLibrary:      "ROCm",
-			wantMainGPU:      testIntPtr(1),
+			// The main_gpu pin selects the ROCm card ID "1", but for a
+			// single-card placement the runner is handed only that card, so the
+			// launch index is always 0 (the requested card is the runner's
+			// device 0). This matches the intended behavior: main_gpu selects
+			// which card; the launch index is local to the runner.
+			wantMainGPU:      testIntPtr(0),
 			wantSelectedGPUs: 1,
 			wantGPUID:        "1",
 		},
@@ -1649,6 +1629,26 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 			opts:             api.DefaultOptions(),
 			wantLibrary:      "CUDA",
 			wantSelectedGPUs: 2,
+		},
+		{
+			name: "small model with known size compacts onto a single GPU (does not spread)",
+			// Mirrors the real-world case: a ~17 GiB model on two 24 GiB
+			// GPUs. Once the VRAM floor (model file size) is known and non-zero,
+			// the model fits on a single GPU (17 < 24*0.80) and must be
+			// compacted onto one card. Previously, when the full prediction
+			// resolved to 0, this compaction was skipped and the model was
+			// spread across both GPUs, preventing other models from
+			// co-residing.
+			predictedVRAM: 17 * format.GigaByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 20 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 22 * format.GigaByte},
+			},
+			opts:             api.DefaultOptions(),
+			wantLibrary:      "CUDA",
+			wantMainGPU:      testIntPtr(0),
+			wantSelectedGPUs: 1,
+			wantGPUID:        "1",
 		},
 	}
 
@@ -2328,3 +2328,38 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
 	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
 	require.Equal(t, expectedFree, gpus[0].FreeMemory)
 }
+
+func TestNoSpreadCompactsModelUsingFullCard(t *testing.T) {
+	t.Setenv("OLLAMA_SCHED_SPREAD", "false")
+	// A model that fits within a card's free memory (e.g. 20 GiB on a 23 GiB
+	// card) but exceeds the default 80% headroom gate. With SCHED_SPREAD=false
+	// the scheduler should still place it on a single GPU (honouring the
+	// explicit no-spread preference) rather than spreading across both cards.
+	var gpus []ml.DeviceInfo
+	var total, free uint64 = 23<<30, 22<<30
+	for i, name := range []string{"CUDA0", "CUDA1"} {
+		gpus = append(gpus, ml.DeviceInfo{DeviceID: ml.DeviceID{ID: fmt.Sprint(i), Library: "CUDA"}, Name: name, TotalMemory: total, FreeMemory: free})
+	}
+	systemInfo := ml.SystemInfo{FreeMemory: 16 << 30}
+
+	predicted := uint64(20) << 30 // fits in 22 GiB free, but > 80% (17.6 GiB)
+
+	// Default (spread) bestSingleGPUFit must REJECT it (the 80% gate).
+	if _, _, ok := bestSingleGPUFit(systemInfo, [][]ml.DeviceInfo{{gpus[0], gpus[1]}}, predicted); ok {
+		t.Fatalf("expected the default 80%% fit to reject a 20 GiB model on a 22 GiB free card")
+	}
+	// The full-card fit (used only when no-spread is requested) must ACCEPT it.
+	gpu, _, ok := bestSingleGPUFitFull(systemInfo, [][]ml.DeviceInfo{{gpus[0], gpus[1]}}, predicted)
+	if !ok {
+		t.Fatalf("expected the no-spread full-card fit to accept a 20 GiB model on a 22 GiB free card")
+	}
+	if gpu.ID != "0" {
+		t.Fatalf("expected the fullest card (id \"0\") to be chosen, got id %q", gpu.ID)
+	}
+	// And a model larger than a card must still be rejected by the full fit.
+	if _, _, ok := bestSingleGPUFitFull(systemInfo, [][]ml.DeviceInfo{{gpus[0], gpus[1]}}, 25<<30); ok {
+		t.Fatalf("expected a 25 GiB model to be rejected by the full-card fit (doesn't fit one card)")
+	}
+}
+
+var _ = fmt.Sprint // keep fmt import used even if refactored

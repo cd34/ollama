@@ -2869,6 +2869,39 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
 	return weights + kvCache
 }
 
+// PredictServerVRAMFloor returns a non-zero lower bound on the VRAM a model
+// will use, even when the full prediction is unavailable (e.g. the KV cache
+// terms resolve to 0). It is safe to use as a fallback floor for placement
+// decisions such as single-GPU compaction, which otherwise would be skipped
+// when the full prediction is 0 and the model would be spread across all
+// GPUs even though it fits on a single one. It does not attempt to estimate
+// the KV cache; it is a conservative lower bound (at minimum the model file
+// size, plus a small per-layer allowance for KV). It never returns a value
+// smaller than the model file size when that is known, and never returns 0
+// when a model path is provided, so callers can rely on it to distinguish
+// "size is known" from "size is unknown" (the 0 case).
+func PredictServerVRAMFloor(modelPath string, f *gguf.Model) uint64 {
+	weights := modelFileSize(modelPath, f)
+	if weights == 0 {
+		return 0
+	}
+
+	// Add a conservative per-layer KV allowance so that a zero KV terms (e.g.
+	// unknown head dims) still yields a lower bound above the raw file size.
+	// This is a floor, not a prediction: it only needs to be "good enough" to
+	// let a model that fits on one GPU be compacted there.
+	if f != nil {
+		kvHeads := f.KV().HeadCountKVMin()
+		if kvHeads == 0 {
+			kvHeads = 1
+		}
+		perLayerKV := kvHeads * 64 // head_dim lower bound = 64 bytes * 2 (K+V)
+		return weights + uint64(f.KV().BlockCount())*perLayerKV
+	}
+
+	return weights
+}
+
 // memoryParsingWriter wraps an io.Writer and parses llama-server log output
 // for buffer size lines. It updates the runner's per-device VRAM tracking.
 //

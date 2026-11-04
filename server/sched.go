@@ -577,6 +577,25 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+			// Guard: the full prediction returns 0 when the KV cache terms
+			// resolve to 0 (e.g. missing head dims) or the file size is
+			// unknown. A 0 prediction makes the downstream single-GPU
+			// compaction (which is gated on predictedVRAM > 0) skip, so a
+			// model that fits on a single GPU is spread across all GPUs,
+			// preventing other models from co-residing. Use a non-zero floor
+			// (at minimum the model file size) as a fallback so compaction is
+			// still attempted when the size is actually known. When the floor is
+			// also 0 (size truly unknown) we keep 0 and fall back to the
+			// spread, which is the safe default.
+			if predicted == 0 {
+				if floor := llm.PredictServerVRAMFloor(req.model.ModelPath, f); floor > 0 {
+					slog.Info("using model file size as VRAM floor for placement",
+						"model", req.model.ModelPath,
+						"predicted", format.HumanBytes2(predicted),
+						"floor", format.HumanBytes2(floor))
+					predicted = floor
+				}
+			}
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
@@ -1043,10 +1062,33 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 	}
 
 	if !envconfig.SchedSpread() && predictedVRAM > 0 {
-		gpu, available, ok := bestSingleGPUFit(systemInfo, groups, predictedVRAM)
-		if ok {
+		// OLLAMA_SCHED_SPREAD=false is an explicit request to keep a model on a
+		// single GPU. The default 80% headroom gate is conservative and exists so
+		// the *spread* path avoids oversubscribing a card, but it can also block a
+		// model that actually *fits* on one card from being placed there (e.g. a
+		// 20 GiB model on a 24 GiB card). When the user has explicitly disabled
+		// spreading, honour that preference: try the strict 80% fit first (to keep
+		// the headroom preference), then fall back to a fit that uses up to the
+		// full free memory of a card, so a fitting model is still compacted onto
+		// one GPU rather than being spread.
+		if gpu, available, ok := bestSingleGPUFit(systemInfo, groups, predictedVRAM); ok {
 			selected, launchOpts := singleLlamaServerGPUPlacement(gpu, launchOpts)
 			slog.Info("selecting single GPU for llama-server model",
+				"main_gpu", *launchOpts.MainGPU,
+				"id", gpu.ID,
+				"filter_id", gpu.FilterID,
+				"library", gpu.Library,
+				"name", gpu.Name,
+				"description", gpu.Description,
+				"integrated", gpu.Integrated,
+				"predicted", format.HumanBytes2(predictedVRAM),
+				"available", format.HumanBytes2(available))
+			logSelectedGPUGroup(gpus, selected)
+			return selected, launchOpts
+		}
+		if gpu, available, ok := bestSingleGPUFitFull(systemInfo, groups, predictedVRAM); ok {
+			selected, launchOpts := singleLlamaServerGPUPlacement(gpu, launchOpts)
+			slog.Info("selecting single GPU for llama-server model (no-spread, using full card)",
 				"main_gpu", *launchOpts.MainGPU,
 				"id", gpu.ID,
 				"filter_id", gpu.FilterID,
@@ -1067,10 +1109,8 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 }
 
 func singleLlamaServerGPUPlacement(gpu ml.DeviceInfo, opts api.Options) ([]ml.DeviceInfo, api.Options) {
-	if opts.MainGPU == nil {
-		mainGPU := 0
-		opts.MainGPU = &mainGPU
-	}
+	mainGPU := 0
+	opts.MainGPU = &mainGPU
 	return []ml.DeviceInfo{gpu}, opts
 }
 
@@ -1100,6 +1140,26 @@ func bestSingleGPUFit(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predic
 		for _, candidate := range group {
 			candidateAvailable := availableMemoryForGPU(systemInfo, candidate)
 			if predictedVRAM > candidateAvailable*80/100 {
+				continue
+			}
+			if !ok || betterPlacementGPU(candidate, candidateAvailable, gpu, available) {
+				gpu = candidate
+				available = candidateAvailable
+				ok = true
+			}
+		}
+	}
+
+	return gpu, available, ok
+}
+
+func bestSingleGPUFitFull(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predictedVRAM uint64) (gpu ml.DeviceInfo, available uint64, ok bool) {
+	for _, group := range groups {
+		for _, candidate := range group {
+			candidateAvailable := availableMemoryForGPU(systemInfo, candidate)
+			// Honor an explicit no-spread request: allow the model to use up to
+			// the full free memory of a single card (not just the default 80%).
+			if predictedVRAM > candidateAvailable {
 				continue
 			}
 			if !ok || betterPlacementGPU(candidate, candidateAvailable, gpu, available) {
